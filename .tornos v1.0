@@ -1,0 +1,1369 @@
+import os, sys, json, shutil, subprocess, ctypes
+from pathlib import Path
+from datetime import datetime
+import atexit
+from ctypes import wintypes
+
+from PySide6.QtCore import Qt, QTimer, QRect, QRectF, QPoint, QPropertyAnimation, QEasingCurve, QThread, Signal, QDir, QFileInfo, QStandardPaths
+from PySide6.QtGui import QPainter, QColor, QFont, QPen, QLinearGradient, QBrush, QCursor, QIcon, QPixmap
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout, QToolButton, QLabel,
+    QMenu, QMessageBox, QFileIconProvider, QFileDialog, QMainWindow,
+    QLineEdit, QListWidget, QListWidgetItem, QTreeView, QFileSystemModel,
+    QSplitter, QStackedWidget, QPushButton, QSystemTrayIcon, QAbstractItemView, QGraphicsDropShadowEffect, QInputDialog, QSlider, QFrame
+)
+
+APP_NAME = "TORNOS 2.0"
+VERSION = "0.9"
+WINDOWS = sys.platform == "win32"
+USER32 = ctypes.windll.user32 if WINDOWS else None
+CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "TORNOS2"
+DOCK_CONFIG = CONFIG_DIR / "dock.json"
+TASKBAR_PREFERENCE = CONFIG_DIR / "hide_taskbar_on_start.flag"
+TASKBAR_STATE = CONFIG_DIR / "taskbar_hidden.flag"
+TASKBAR_HIDDEN = False
+TASKBAR_LOCKED = False
+
+
+def find_chrome():
+    paths = [
+        shutil.which("chrome"),
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+    ]
+    if WINDOWS:
+        try:
+            import winreg
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe") as key:
+                        paths.insert(0, winreg.QueryValue(key, None))
+                except OSError:
+                    pass
+        except ImportError:
+            pass
+    return next((str(p) for p in paths if p and Path(p).is_file()), None)
+
+
+def taskbar(visible):
+    """Hide/show the Windows taskbar while keeping a recovery marker."""
+    global TASKBAR_HIDDEN
+    if not WINDOWS:
+        return False
+    try:
+        USER32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        USER32.FindWindowW.restype = wintypes.HWND
+        USER32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        USER32.ShowWindow.restype = wintypes.BOOL
+        hwnd = USER32.FindWindowW("Shell_TrayWnd", None)
+        if not hwnd:
+            return False
+        if visible:
+            USER32.ShowWindow(hwnd, 5)
+            TASKBAR_HIDDEN = False
+            TASKBAR_STATE.unlink(missing_ok=True)
+        else:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            TASKBAR_STATE.write_text("TORNOS is using desktop mode. Quit TORNOS or use Show Windows Taskbar to restore.\n", encoding="utf-8")
+            USER32.ShowWindow(hwnd, 0)
+            TASKBAR_HIDDEN = True
+        return True
+    except Exception:
+        return False
+
+
+def restore_taskbar():
+    global TASKBAR_LOCKED
+    TASKBAR_LOCKED = False
+    if WINDOWS and (TASKBAR_HIDDEN or TASKBAR_STATE.exists()):
+        taskbar(True)
+
+
+atexit.register(restore_taskbar)
+
+
+def open_path(path):
+    try:
+        if path == "__finder__":
+            return "finder"
+        if path == "__chrome__":
+            chrome = find_chrome()
+            if not chrome:
+                QMessageBox.warning(None, APP_NAME, "Google Chrome was not found. Install Chrome and restart TORNOS.")
+                return
+            subprocess.Popen([chrome])
+        elif path.startswith(("shell:", "ms-settings:")):
+            if WINDOWS:
+                os.startfile(path)
+            else:
+                QMessageBox.information(None, APP_NAME, "This shortcut is available on Windows.")
+        elif Path(path).exists():
+            if WINDOWS:
+                os.startfile(path)
+            else:
+                from PySide6.QtCore import QUrl
+                from PySide6.QtGui import QDesktopServices
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        else:
+            subprocess.Popen([path])
+    except Exception as exc:
+        QMessageBox.warning(None, APP_NAME, f"Could not open:\n{path}\n\n{exc}")
+
+
+def defaults():
+    return [
+        {"name": "Finder", "path": "__finder__", "kind": "finder"},
+        {"name": "Google Chrome", "path": "__chrome__", "kind": "chrome"},
+        {"name": "Notepad", "path": "notepad.exe", "kind": "notes"},
+        {"name": "Calculator", "path": "calc.exe", "kind": "calculator"},
+        {"name": "Settings", "path": "ms-settings:", "kind": "settings"},
+        {"name": "Recycle Bin", "path": "shell:RecycleBinFolder", "kind": "trash"},
+    ]
+
+
+def load_dock():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(DOCK_CONFIG.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            data = [
+                {"name": x["name"][:28], "path": x["path"], "kind": str(x.get("kind", "custom"))}
+                for x in data
+                if isinstance(x, dict)
+                and isinstance(x.get("name"), str) and x.get("name").strip()
+                and isinstance(x.get("path"), str) and x.get("path").strip()
+            ]
+            if data:
+                return data
+    except (OSError, ValueError, TypeError):
+        pass
+    return defaults()
+
+
+def save_dock(items):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = DOCK_CONFIG.with_suffix(".tmp")
+    temporary.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    temporary.replace(DOCK_CONFIG)
+
+
+def common_search_roots():
+    locations = [
+        QStandardPaths.StandardLocation.DesktopLocation,
+        QStandardPaths.StandardLocation.DocumentsLocation,
+        QStandardPaths.StandardLocation.DownloadLocation,
+        QStandardPaths.StandardLocation.PicturesLocation,
+        QStandardPaths.StandardLocation.MusicLocation,
+        QStandardPaths.StandardLocation.MoviesLocation,
+    ]
+    roots = []
+    seen = set()
+    for location in locations:
+        folder = QStandardPaths.writableLocation(location)
+        if folder:
+            path = Path(folder).expanduser()
+            try:
+                key = str(path.resolve()).casefold()
+            except OSError:
+                key = str(path).casefold()
+            if path.is_dir() and key not in seen:
+                roots.append(path)
+                seen.add(key)
+    if not roots:
+        roots = [Path.home()]
+    return roots
+
+
+class SearchWorker(QThread):
+    found = Signal(str)
+    completed = Signal(int, str)
+
+    def __init__(self, query, roots=None):
+        super().__init__()
+        self.query = query.casefold()
+        self.roots = list(roots or common_search_roots())
+
+    def run(self):
+        skip = {".git", ".venv", "venv", "node_modules", "__pycache__", "AppData"}
+        count = 0
+        skipped_folders = 0
+
+        def note_error(_error):
+            nonlocal skipped_folders
+            skipped_folders += 1
+
+        for root in self.roots:
+            if self.isInterruptionRequested():
+                self.completed.emit(count, "Search cancelled.")
+                return
+            try:
+                walker = os.walk(root, onerror=note_error)
+                for current, dirs, files in walker:
+                    if self.isInterruptionRequested():
+                        self.completed.emit(count, "Search cancelled.")
+                        return
+                    dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")]
+                    for name in dirs + files:
+                        if self.isInterruptionRequested():
+                            self.completed.emit(count, "Search cancelled.")
+                            return
+                        if self.query in name.casefold():
+                            self.found.emit(str(Path(current) / name))
+                            count += 1
+                            if count >= 200:
+                                self.completed.emit(count, "200 results shown — limit reached. Search is by file/folder name, not file contents.")
+                                return
+            except (OSError, PermissionError):
+                skipped_folders += 1
+
+        message = f"Search complete — {count} result(s). Search is by file/folder name, not file contents."
+        if skipped_folders:
+            message += f" Some protected folders were skipped ({skipped_folders})."
+        self.completed.emit(count, message)
+
+
+class FinderTitleBar(QWidget):
+    """A lightweight title strip with macOS-style traffic-light controls."""
+    def __init__(self, window):
+        super().__init__(window)
+        self.window_ref = window
+        self.drag_offset = None
+        self.setFixedHeight(32)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(3, 2, 3, 2)
+        row.setSpacing(7)
+        self.red = QPushButton()
+        self.yellow = QPushButton()
+        self.green = QPushButton()
+        for button, color, hover in [
+            (self.red, "#ff5f57", "#ff7770"),
+            (self.yellow, "#febc2e", "#ffd05b"),
+            (self.green, "#28c840", "#51db63"),
+        ]:
+            button.setFixedSize(13, 13)
+            button.setStyleSheet(f"QPushButton{{background:{color};border:1px solid rgba(0,0,0,45);border-radius:6.5px;padding:0}} QPushButton:hover{{background:{hover}}}")
+            row.addWidget(button)
+        self.red.setToolTip("Close Finder")
+        self.yellow.setToolTip("Minimize to TORNOS Dock")
+        self.green.setToolTip("Maximize / Restore")
+        self.red.clicked.connect(window.close)
+        self.yellow.clicked.connect(window.animate_minimize)
+        self.green.clicked.connect(window.toggle_maximize)
+        row.addSpacing(8)
+        title = QLabel("Finder")
+        title.setStyleSheet("font-size:13px;font-weight:650;color:#e8edf5")
+        row.addWidget(title)
+        row.addStretch()
+        hint = QLabel("TORNOS")
+        hint.setStyleSheet("font-size:10px;font-weight:700;color:#8793a5;letter-spacing:1px")
+        row.addWidget(hint)
+        self.setStyleSheet("background:rgba(45,50,61,235);border-top-left-radius:12px;border-top-right-radius:12px;border-bottom:1px solid rgba(255,255,255,18)")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self.window_ref.is_maximized:
+            handle = self.window_ref.windowHandle()
+            try:
+                if handle and handle.startSystemMove():
+                    event.accept()
+                    return
+            except (AttributeError, RuntimeError):
+                pass
+            self.drag_offset = event.globalPosition().toPoint() - self.window_ref.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window_ref.move(event.globalPosition().toPoint() - self.drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.window_ref.toggle_maximize()
+        super().mouseDoubleClickEvent(event)
+
+
+class FinderWindow(QMainWindow):
+    PLACES = [
+        ("Home", Path.home()), ("Desktop", Path.home() / "Desktop"),
+        ("Documents", Path.home() / "Documents"), ("Downloads", Path.home() / "Downloads"),
+        ("Pictures", Path.home() / "Pictures"), ("Music", Path.home() / "Music"),
+        ("Videos", Path.home() / "Videos"),
+    ]
+
+    def __init__(self, dock):
+        super().__init__()
+        self.dock = dock
+        self.setWindowTitle("Finder — TORNOS")
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.resize(880, 570)
+        self.setMinimumSize(650, 420)
+        self._resize_edges = Qt.Edges()
+        self._resize_start_global = None
+        self._resize_start_geometry = None
+        self.back_stack, self.forward_stack = [], []
+        self.current_folder = str(Path.home())
+        self.worker = None
+        self.minimized = False
+        self.minimized_animation_active = False
+        self.is_maximized = False
+        self.normal_geometry = self.geometry()
+        self.restore_geometry = self.geometry()
+        self.window_animation = None
+        self._animation_minimum = None
+        self.setStyleSheet("""
+            QMainWindow { background:transparent; color:#f3f5fa; }
+            QWidget { color:#f3f5fa; }
+            QLineEdit { background:#343946; color:white; border:1px solid #4b5363;
+                border-radius:9px; padding:8px 10px; }
+            QListWidget,QTreeView { background:#252a34; color:#edf1f7; border:0;
+                alternate-background-color:#2c323d; }
+            QListWidget::item,QTreeView::item { padding:6px; }
+            QListWidget::item:selected,QTreeView::item:selected { background:#416fa9; }
+            QPushButton { background:#353c49; color:white; border:1px solid #4b5362;
+                border-radius:8px; padding:7px 11px; }
+            QPushButton:hover { background:#48566d; }
+        """)
+
+        central = QWidget()
+        central.setObjectName("finderFrame")
+        central.setStyleSheet("QWidget#finderFrame { background:#20232c; border:1px solid #596273; border-radius:14px; }")
+        shadow = QGraphicsDropShadowEffect(central)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 5)
+        shadow.setColor(QColor(0, 0, 0, 125))
+        central.setGraphicsEffect(shadow)
+        self.frame_widget = central
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(9, 8, 9, 9)
+        self.titlebar = FinderTitleBar(self)
+        layout.addWidget(self.titlebar)
+        heading = QHBoxLayout()
+        heading.addStretch()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search common folders…")
+        self.search.setFixedWidth(300)
+        self.search.returnPressed.connect(self.search_files)
+        heading.addWidget(self.search)
+        layout.addLayout(heading)
+
+        nav = QHBoxLayout()
+        self.back = QPushButton("‹")
+        self.back.setFixedWidth(36)
+        self.back.clicked.connect(self.go_back)
+        nav.addWidget(self.back)
+        self.forward = QPushButton("›")
+        self.forward.setFixedWidth(36)
+        self.forward.clicked.connect(self.go_forward)
+        nav.addWidget(self.forward)
+        up = QPushButton("↑")
+        up.setFixedWidth(36)
+        up.clicked.connect(self.go_up)
+        nav.addWidget(up)
+        self.address = QLineEdit(self.current_folder)
+        self.address.returnPressed.connect(lambda: self.navigate(self.address.text(), True))
+        nav.addWidget(self.address, 1)
+        go = QPushButton("Go")
+        go.clicked.connect(lambda: self.navigate(self.address.text(), True))
+        nav.addWidget(go)
+        layout.addLayout(nav)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.sidebar = QListWidget()
+        self.sidebar.setFixedWidth(160)
+        self.sidebar.setStyleSheet("QListWidget{background:#2a303b;border-radius:9px;padding:6px}")
+        for label, path in self.PLACES:
+            item = QListWidgetItem("  " + label)
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            self.sidebar.addItem(item)
+        self.sidebar.currentRowChanged.connect(self.sidebar_changed)
+        split.addWidget(self.sidebar)
+
+        self.pages = QStackedWidget()
+        self.model = QFileSystemModel(self)
+        self.model.setFilter(QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot)
+        self.model.setRootPath(str(Path.home()))
+        self.tree = QTreeView()
+        self.tree.setModel(self.model)
+        self.tree.setRootIndex(self.model.index(self.current_folder))
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSortingEnabled(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.doubleClicked.connect(self.open_tree_item)
+        self.tree.setColumnWidth(0, 330)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_tree_context_menu)
+        self.pages.addWidget(self.tree)
+        self.results = QListWidget()
+        self.results.itemDoubleClicked.connect(self.open_result)
+        self.results.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.results.customContextMenuRequested.connect(self.show_results_context_menu)
+        self.pages.addWidget(self.results)
+        split.addWidget(self.pages)
+        split.setStretchFactor(1, 1)
+        layout.addWidget(split, 1)
+
+        bottom = QHBoxLayout()
+        self.status = QLabel("Browse folders or search by name.")
+        self.status.setStyleSheet("color:#aeb8c8;")
+        bottom.addWidget(self.status)
+        bottom.addStretch()
+        new_folder_btn = QPushButton("+ New Folder")
+        new_folder_btn.clicked.connect(lambda: self.create_folder(self.current_folder))
+        bottom.addWidget(new_folder_btn)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_folder)
+        bottom.addWidget(refresh_btn)
+        home_btn = QPushButton("Open Home Folder")
+        home_btn.clicked.connect(lambda: open_path(str(Path.home())))
+        bottom.addWidget(home_btn)
+        layout.addLayout(bottom)
+        self.setCentralWidget(central)
+        self.sidebar.setCurrentRow(0)
+        self.navigate(self.current_folder, False)
+        screen = QApplication.primaryScreen()
+        if screen:
+            full = screen.geometry()
+            area = QRect(full.x(), full.y()+36, full.width(), max(420, full.height()-145))
+            self.move(area.center() - self.rect().center())
+        self.normal_geometry = QRect(self.geometry())
+        self.restore_geometry = QRect(self.geometry())
+
+    def _edges_at(self, point):
+        margin = 7
+        edges = Qt.Edges()
+        if point.x() <= margin:
+            edges |= Qt.Edge.LeftEdge
+        elif point.x() >= self.width() - margin:
+            edges |= Qt.Edge.RightEdge
+        if point.y() <= margin:
+            edges |= Qt.Edge.TopEdge
+        elif point.y() >= self.height() - margin:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def _cursor_for_edges(self, edges):
+        left = bool(edges & Qt.Edge.LeftEdge)
+        right = bool(edges & Qt.Edge.RightEdge)
+        top = bool(edges & Qt.Edge.TopEdge)
+        bottom = bool(edges & Qt.Edge.BottomEdge)
+        if (left and top) or (right and bottom):
+            return Qt.CursorShape.SizeFDiagCursor
+        if (right and top) or (left and bottom):
+            return Qt.CursorShape.SizeBDiagCursor
+        if left or right:
+            return Qt.CursorShape.SizeHorCursor
+        if top or bottom:
+            return Qt.CursorShape.SizeVerCursor
+        return Qt.CursorShape.ArrowCursor
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self.is_maximized:
+            edges = self._edges_at(event.position().toPoint())
+            if edges:
+                handle = self.windowHandle()
+                try:
+                    if handle and handle.startSystemResize(edges):
+                        event.accept()
+                        return
+                except (AttributeError, RuntimeError):
+                    pass
+                self._resize_edges = edges
+                self._resize_start_global = event.globalPosition().toPoint()
+                self._resize_start_geometry = QRect(self.geometry())
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._resize_start_global is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            delta = event.globalPosition().toPoint() - self._resize_start_global
+            start = self._resize_start_geometry
+            left, top, right, bottom = start.left(), start.top(), start.right(), start.bottom()
+            if self._resize_edges & Qt.Edge.LeftEdge:
+                left = min(right - self.minimumWidth() + 1, left + delta.x())
+            if self._resize_edges & Qt.Edge.RightEdge:
+                right = max(left + self.minimumWidth() - 1, right + delta.x())
+            if self._resize_edges & Qt.Edge.TopEdge:
+                top = min(bottom - self.minimumHeight() + 1, top + delta.y())
+            if self._resize_edges & Qt.Edge.BottomEdge:
+                bottom = max(top + self.minimumHeight() - 1, bottom + delta.y())
+            self.setGeometry(QRect(QPoint(left, top), QPoint(right, bottom)))
+            event.accept()
+            return
+        if not self.is_maximized:
+            self.setCursor(self._cursor_for_edges(self._edges_at(event.position().toPoint())))
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._resize_start_global = None
+        self._resize_start_geometry = None
+        self._resize_edges = Qt.Edges()
+        super().mouseReleaseEvent(event)
+
+    def _animation(self, target, duration=250, finish=None):
+        if self.window_animation:
+            self.window_animation.stop()
+        self.window_animation = QPropertyAnimation(self, b"geometry", self)
+        self.window_animation.setDuration(duration)
+        self.window_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self.window_animation.setStartValue(self.geometry())
+        self.window_animation.setEndValue(target)
+        if finish:
+            self.window_animation.finished.connect(finish)
+        self.window_animation.start()
+
+    def animate_minimize(self):
+        if self.minimized_animation_active:
+            return
+        self.restore_geometry = self.geometry()
+        if self.is_maximized:
+            self.restore_geometry = QRect(self.geometry())
+        self.dock.reveal()
+        target = self.dock.finder_icon_rect()
+        self._animation_minimum = self.minimumSize()
+        self.setMinimumSize(0, 0)
+        self.minimized = True
+        self.minimized_animation_active = True
+
+        def finish():
+            self.hide()
+            self.minimized = True
+            self.minimized_animation_active = False
+            self.setMinimumSize(self._animation_minimum)
+        self._animation(target, 260, finish)
+
+    def animate_restore(self):
+        if not self.minimized:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            return
+        target = QRect(self.restore_geometry)
+        start = self.dock.finder_icon_rect()
+        self._animation_minimum = self.minimumSize()
+        self.setMinimumSize(0, 0)
+        self.setGeometry(start)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.minimized = False
+        self.minimized_animation_active = False
+
+        def finish():
+            self.setMinimumSize(self._animation_minimum)
+        self._animation(target, 260, finish)
+
+    def toggle_maximize(self):
+        if self.minimized:
+            self.animate_restore()
+            QTimer.singleShot(280, self.toggle_maximize)
+            return
+        if self.window_animation:
+            self.window_animation.stop()
+        if not self.is_maximized:
+            self.normal_geometry = QRect(self.geometry())
+            screen = self.screen() or QApplication.primaryScreen()
+            full = screen.geometry()
+            # Keep the entire title bar and its traffic-light controls below TORNOS' menu bar.
+            top = full.y() + 36
+            bottom_reserve = 112
+            target = QRect(full.x(), top, full.width(), max(420, full.height()-(top-full.y())-bottom_reserve))
+            self.is_maximized = True
+            self.frame_widget.setStyleSheet("QWidget#finderFrame { background:#20232c; border:0px; border-radius:0px; }")
+        else:
+            target = QRect(self.normal_geometry)
+            self.is_maximized = False
+            self.frame_widget.setStyleSheet("QWidget#finderFrame { background:#20232c; border:1px solid #596273; border-radius:14px; }")
+        self._animation(target, 220)
+
+    def closeEvent(self, event):
+        if self.window_animation:
+            self.window_animation.stop()
+        if self.worker and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.wait()
+        super().closeEvent(event)
+
+    def navigate(self, path, remember=True):
+        target = Path(os.path.expandvars(path)).expanduser()
+        if not target.exists() or not target.is_dir():
+            self.status.setText("Folder not found. Check the address and try again.")
+            return
+        target = str(target.resolve())
+        if remember and target != self.current_folder:
+            self.back_stack.append(self.current_folder)
+            self.forward_stack.clear()
+        self.current_folder = target
+        self.address.setText(target)
+        self.tree.setRootIndex(self.model.index(target))
+        self.pages.setCurrentWidget(self.tree)
+        self.status.setText(target)
+        self.back.setEnabled(bool(self.back_stack))
+        self.forward.setEnabled(bool(self.forward_stack))
+
+    def sidebar_changed(self, row):
+        if row >= 0:
+            self.navigate(self.sidebar.item(row).data(Qt.ItemDataRole.UserRole), True)
+
+    def go_back(self):
+        if self.back_stack:
+            self.forward_stack.append(self.current_folder)
+            self.navigate(self.back_stack.pop(), False)
+
+    def go_forward(self):
+        if self.forward_stack:
+            self.back_stack.append(self.current_folder)
+            self.navigate(self.forward_stack.pop(), False)
+
+    def go_up(self):
+        parent = str(Path(self.current_folder).parent)
+        if parent != self.current_folder:
+            self.navigate(parent, True)
+
+    def open_tree_item(self, index):
+        index = index.siblingAtColumn(0)
+        path = self.model.filePath(index)
+        if self.model.isDir(index):
+            self.navigate(path, True)
+        else:
+            open_path(path)
+
+    @staticmethod
+    def valid_child_name(name):
+        if not name or name in {".", ".."} or name != name.strip():
+            return False
+        if any(char in name for char in '<>:\"/\\|?*'):
+            return False
+        if name.endswith((" ", ".")):
+            return False
+        device_stem = name.split(".", 1)[0].rstrip(" .").upper()
+        reserved = {"CON", "PRN", "AUX", "NUL"}
+        if device_stem in reserved:
+            return False
+        if device_stem.startswith("COM") and device_stem[3:] in "123456789":
+            return False
+        if device_stem.startswith("LPT") and device_stem[3:] in "123456789":
+            return False
+        return Path(name).name == name
+
+    def create_folder(self, parent_folder):
+        parent = Path(parent_folder)
+        if not parent.is_dir():
+            QMessageBox.warning(self, "New Folder", "The selected location is no longer available.")
+            return
+        name, accepted = QInputDialog.getText(self, "New Folder", "Folder name:")
+        if not accepted:
+            return
+        name = name.strip()
+        if not self.valid_child_name(name):
+            QMessageBox.warning(self, "New Folder", "Invalid Windows folder name. Avoid reserved characters and names ending in a dot or space.")
+            return
+        destination = parent / name
+        try:
+            destination.mkdir()
+            self.status.setText(f"Created folder: {destination}")
+            self.model.setRootPath(self.current_folder)
+            self.tree.setRootIndex(self.model.index(self.current_folder))
+        except FileExistsError:
+            QMessageBox.warning(self, "New Folder", "A file or folder with that name already exists here.")
+        except OSError as exc:
+            QMessageBox.warning(self, "New Folder", f"Windows could not create that folder.\n\n{exc}")
+
+    def rename_path(self, path_text):
+        path = Path(path_text)
+        if not path.exists() or not path.name:
+            QMessageBox.warning(self, "Rename", "This item is no longer available to rename.")
+            return None
+        name, accepted = QInputDialog.getText(self, "Rename", "New name:", text=path.name)
+        if not accepted:
+            return None
+        name = name.strip()
+        if name == path.name:
+            return None
+        if not self.valid_child_name(name):
+            QMessageBox.warning(self, "Rename", "Invalid Windows name. Avoid reserved characters and names ending in a dot or space.")
+            return None
+        if name.casefold() == path.name.casefold() and name != path.name:
+            QMessageBox.information(self, "Rename", "A case-only rename is not supported in this version. Choose a name with at least one different character.")
+            return None
+        destination = path.with_name(name)
+        if destination.exists():
+            QMessageBox.warning(self, "Rename", "Another file or folder already uses that name.")
+            return None
+        try:
+            path.rename(destination)
+            self.status.setText(f"Renamed to: {destination.name}")
+            self.model.setRootPath(self.current_folder)
+            self.tree.setRootIndex(self.model.index(self.current_folder))
+            return str(destination)
+        except OSError as exc:
+            QMessageBox.warning(self, "Rename", f"Windows could not rename this item.\n\n{exc}")
+            return None
+
+    def copy_path(self, path):
+        QApplication.clipboard().setText(str(path))
+        self.status.setText("Path copied to clipboard.")
+
+    def show_tree_context_menu(self, position):
+        index = self.tree.indexAt(position)
+        menu = QMenu(self)
+        if not index.isValid():
+            menu.addAction("New Folder…", lambda: self.create_folder(self.current_folder))
+            menu.addAction("Refresh", self.refresh_folder)
+        else:
+            index = index.siblingAtColumn(0)
+            path = self.model.filePath(index)
+            is_directory = self.model.isDir(index)
+            menu.addAction("Open", lambda p=path, d=is_directory: self.navigate(p, True) if d else open_path(p))
+            menu.addAction("Rename…", lambda p=path: self.rename_path(p))
+            menu.addAction("Copy Path", lambda p=path: self.copy_path(p))
+            menu.addAction("Show in Windows Explorer", lambda p=path: open_path(str(Path(p) if Path(p).is_dir() else Path(p).parent)))
+            menu.addSeparator()
+            menu.addAction("New Folder Here…", lambda p=path: self.create_folder(p if is_directory else str(Path(p).parent)))
+            menu.addAction("Refresh", self.refresh_folder)
+        menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def show_results_context_menu(self, position):
+        item = self.results.itemAt(position)
+        if item is None:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        menu.addAction("Open", lambda p=path: self.navigate(p, True) if Path(p).is_dir() else open_path(p))
+        menu.addAction("Open Containing Folder", lambda p=path: open_path(str(Path(p).parent)))
+        menu.addAction("Rename…", lambda target=item, p=path: self.rename_result(target, p))
+        menu.addAction("Copy Path", lambda p=path: self.copy_path(p))
+        menu.exec(self.results.viewport().mapToGlobal(position))
+
+    def rename_result(self, item, path):
+        new_path = self.rename_path(path)
+        if new_path:
+            item.setText(new_path)
+            item.setData(Qt.ItemDataRole.UserRole, new_path)
+
+    def refresh_folder(self):
+        self.model.setRootPath(self.current_folder)
+        self.tree.setRootIndex(self.model.index(self.current_folder))
+        self.status.setText("Folder view refreshed.")
+
+    def search_files(self):
+        query = self.search.text().strip()
+        if len(query) < 2:
+            self.status.setText("Enter at least 2 characters to search.")
+            return
+        if self.worker and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.wait()
+        self.results.clear()
+        self.pages.setCurrentWidget(self.results)
+        self.status.setText("Searching your Desktop, Documents, Downloads and media folders by name…")
+        self.worker = SearchWorker(query)
+        self.worker.found.connect(self.add_result)
+        self.worker.completed.connect(lambda _n, message: self.status.setText(message))
+        self.worker.start()
+
+    def add_result(self, path):
+        item = QListWidgetItem(path)
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        self.results.addItem(item)
+
+    def open_result(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if Path(path).is_dir():
+            self.navigate(path, True)
+        else:
+            open_path(path)
+
+
+
+class ControlCentre(QWidget):
+    """Floating macOS-inspired Control Centre based on the supplied MyDockFinder reference."""
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setFixedSize(304, 372)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setStyleSheet("""
+            QWidget { color:#f3f5fa; font-family:'Segoe UI'; font-size:12px; }
+            QFrame#shell { background:rgba(31,37,49,246); border:1px solid rgba(210,220,238,95); border-radius:19px; }
+            QFrame.tile { background:rgba(51,59,73,238); border:1px solid rgba(255,255,255,30); border-radius:13px; }
+            QFrame.tile[active="true"] { background:rgba(38,105,211,245); }
+            QLabel.title { font-size:12px; font-weight:700; }
+            QLabel.sub { color:#aeb8c8; font-size:10px; }
+            QPushButton { color:#f5f7fb; background:rgba(73,83,101,220); border:1px solid rgba(255,255,255,35); border-radius:10px; padding:7px; text-align:left; }
+            QPushButton:hover { background:rgba(100,117,143,245); }
+            QPushButton:checked { background:#236bd3; }
+            QSlider::groove:horizontal { height:8px; background:#4b5361; border-radius:4px; }
+            QSlider::sub-page:horizontal { background:#dce6f6; border-radius:4px; }
+            QSlider::handle:horizontal { background:white; width:19px; margin:-5px 0; border-radius:10px; }
+        """)
+        outer=QVBoxLayout(self); outer.setContentsMargins(0,0,0,0)
+        shell=QFrame(); shell.setObjectName('shell'); outer.addWidget(shell)
+        lay=QVBoxLayout(shell); lay.setContentsMargins(10,10,10,10); lay.setSpacing(8)
+
+        top=QHBoxLayout(); top.setSpacing(8)
+        left=QVBoxLayout(); left.setSpacing(5)
+        self.wifi=self.make_tile('◉','Wi-Fi','Open network controls',True)
+        self.bluetooth=self.make_tile('ᛒ','Bluetooth','Open Bluetooth controls',True)
+        self.hotspot=self.make_tile('↗','Hotspot','Mobile hotspot',False)
+        for tile in (self.wifi,self.bluetooth,self.hotspot): left.addWidget(tile)
+        top.addLayout(left, 3)
+        right=QVBoxLayout(); right.setSpacing(6)
+        self.focus=self.make_tile('◐','Focus','Do not disturb',False)
+        self.focus.setFixedHeight(66)
+        self.focus.mousePressEvent=self.toggle_focus
+        right.addWidget(self.focus)
+        pair=QHBoxLayout(); pair.setSpacing(6)
+        self.stage=self.make_tile('▣','Stage\nManager','Window layout',False); self.stage.setFixedHeight(70)
+        self.mirror=self.make_tile('▢','Screen\nMirroring','Display devices',False); self.mirror.setFixedHeight(70)
+        self.stage.mousePressEvent=lambda e: open_path('ms-settings:multitasking')
+        self.mirror.mousePressEvent=lambda e: self.open_quick_settings()
+        pair.addWidget(self.stage); pair.addWidget(self.mirror); right.addLayout(pair)
+        top.addLayout(right, 4); lay.addLayout(top)
+
+        self.brightness_value=QLabel('Display')
+        self.brightness_value.setStyleSheet('font-weight:700; color:#dfe5ef;')
+        brightness_box=self.slider_box(self.brightness_value, '☼')
+        self.brightness=brightness_box[1]; lay.addWidget(brightness_box[0])
+        self.brightness.valueChanged.connect(self.set_brightness)
+
+        self.volume_value=QLabel('Sound')
+        self.volume_value.setStyleSheet('font-weight:700; color:#dfe5ef;')
+        volume_box=self.slider_box(self.volume_value, '◖))')
+        self.volume=volume_box[1]; lay.addWidget(volume_box[0])
+        self.volume.valueChanged.connect(self.set_volume)
+
+        media=QFrame(); media.setObjectName('media'); media.setProperty('class','tile'); media.setStyleSheet('QFrame#media{background:rgba(48,55,68,235);border:1px solid rgba(255,255,255,28);border-radius:13px;}')
+        ml=QHBoxLayout(media); ml.setContentsMargins(12,7,10,7)
+        note=QLabel('♫'); note.setStyleSheet('font-size:23px;color:#aeb8c8;'); ml.addWidget(note)
+        ml.addStretch()
+        prev=QPushButton('◀'); prev.setFixedSize(30,30); prev.clicked.connect(lambda: self.media_key(0xB1)); ml.addWidget(prev)
+        play=QPushButton('▶'); play.setFixedSize(30,30); play.clicked.connect(lambda: self.media_key(0xB3)); ml.addWidget(play)
+        nxt=QPushButton('▶▶'); nxt.setFixedSize(36,30); nxt.clicked.connect(lambda: self.media_key(0xB0)); ml.addWidget(nxt)
+        lay.addWidget(media)
+        self._load_system_values()
+
+    def make_tile(self, icon, title, subtitle, active):
+        tile=QFrame(); tile.setProperty('class','tile'); tile.setProperty('active', 'true' if active else 'false')
+        tile.setStyleSheet('QFrame{background:rgba(51,59,73,238);border:1px solid rgba(255,255,255,32);border-radius:12px;} QFrame[active="true"]{background:rgba(34,105,215,245);}')
+        row=QHBoxLayout(tile); row.setContentsMargins(9,6,7,6); row.setSpacing(8)
+        badge=QLabel(icon); badge.setFixedSize(26,26); badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setStyleSheet('background:rgba(255,255,255,24);border-radius:13px;font-size:15px;font-weight:700;')
+        texts=QVBoxLayout(); texts.setSpacing(0)
+        name=QLabel(title); name.setStyleSheet('font-weight:700;font-size:11px;')
+        sub=QLabel(subtitle); sub.setStyleSheet('color:#b8c2d1;font-size:9px;')
+        texts.addWidget(name); texts.addWidget(sub)
+        row.addWidget(badge); row.addLayout(texts,1)
+        tile.setMinimumHeight(43)
+        tile.mousePressEvent=lambda e: self.open_quick_settings()
+        return tile
+
+    def slider_box(self, title, icon):
+        box=QFrame(); box.setStyleSheet('QFrame{background:rgba(48,55,68,235);border:1px solid rgba(255,255,255,28);border-radius:12px;}')
+        v=QVBoxLayout(box); v.setContentsMargins(10,7,10,7); v.setSpacing(5)
+        v.addWidget(title)
+        row=QHBoxLayout(); row.setSpacing(8)
+        glyph=QLabel(icon); glyph.setFixedWidth(18); glyph.setStyleSheet('font-size:17px;color:#d7deea;'); row.addWidget(glyph)
+        slider=QSlider(Qt.Orientation.Horizontal); slider.setRange(0,100); slider.setValue(50); row.addWidget(slider,1)
+        v.addLayout(row)
+        return box,slider
+
+    def _load_system_values(self):
+        if not WINDOWS:
+            return
+        try:
+            from pycaw.pycaw import AudioUtilities
+            endpoint=AudioUtilities.GetSpeakers().EndpointVolume
+            self.volume.blockSignals(True); self.volume.setValue(int(endpoint.GetMasterVolumeLevelScalar()*100)); self.volume.blockSignals(False)
+        except Exception: pass
+        try:
+            script="$m=Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Select-Object -First 1 -ExpandProperty CurrentBrightness; if($null -ne $m){$m}"
+            result=subprocess.run(['powershell','-NoProfile','-Command',script],capture_output=True,text=True,timeout=3,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            value=int(result.stdout.strip())
+            self.brightness.blockSignals(True); self.brightness.setValue(max(0,min(100,value))); self.brightness.blockSignals(False)
+        except Exception: pass
+
+    def set_volume(self,value):
+        if not WINDOWS:return
+        try:
+            from pycaw.pycaw import AudioUtilities
+            AudioUtilities.GetSpeakers().EndpointVolume.SetMasterVolumeLevelScalar(value/100.0,None)
+        except Exception:
+            self.open_sound_settings()
+
+    def set_brightness(self,value):
+        if not WINDOWS:return
+        try:
+            script=f"(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop | Select-Object -First 1).WmiSetBrightness(1,{int(value)})"
+            subprocess.run(['powershell','-NoProfile','-Command',script],capture_output=True,text=True,timeout=4,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),check=True)
+        except Exception: pass
+
+    def open_quick_settings(self):
+        if WINDOWS:
+            try:
+                USER32.keybd_event(0x5B,0,0,0); USER32.keybd_event(0x41,0,0,0)
+                USER32.keybd_event(0x41,0,2,0); USER32.keybd_event(0x5B,0,2,0)
+            except Exception: open_path('ms-settings:network')
+
+    def open_sound_settings(self): open_path('ms-settings:sound')
+    def toggle_focus(self,event):
+        self.focus.setProperty('active', 'true' if self.focus.property('active')!='true' else 'false')
+        self.focus.style().unpolish(self.focus); self.focus.style().polish(self.focus)
+    def media_key(self,key):
+        if WINDOWS:
+            try: USER32.keybd_event(key,0,0,0); USER32.keybd_event(key,0,2,0)
+            except Exception: pass
+
+
+class MenuBar(QWidget):
+    def __init__(self, dock):
+        super().__init__()
+        self.dock=dock
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint|Qt.WindowType.WindowStaysOnTopHint|Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedHeight(31)
+        row=QHBoxLayout(self); row.setContentsMargins(16,0,16,0); row.setSpacing(10)
+        brand=QLabel('◉'); brand.setStyleSheet('color:#f5f7fb;font-size:17px;font-weight:700;'); row.addWidget(brand)
+        self.add_menu(row,'TORNOS',[('About TORNOS 2.0',self.about),('Open Finder',dock.open_finder),('Quit TORNOS',QApplication.quit)])
+        self.add_menu(row,'File',[('New Finder Window',dock.open_finder),('Add Application to Dock…',dock.add_item)])
+        self.add_menu(row,'Edit',[('Dock & Finder Help',dock.help)])
+        self.add_menu(row,'View',[('Show Dock',dock.reveal),('Hide Windows Taskbar',dock.hide_taskbar),('Show Windows Taskbar',dock.show_taskbar)])
+        self.add_menu(row,'Window',[('Finder',dock.open_finder)])
+        self.add_menu(row,'Help',[('TORNOS Help',dock.help)])
+        row.addStretch()
+        self.status_labels=[]
+        for symbol,tip in [('ᛒ','Bluetooth'),('◉','User account'),('▣','Phone connection'),('▱','Display'),('▣','Battery'),('◖))','Sound'),('⏏','Eject'),('⌕','Search')]:
+            lab=QLabel(symbol); lab.setToolTip(tip); lab.setStyleSheet('color:#f0f3f8;font-size:14px;padding:0 2px;'); row.addWidget(lab); self.status_labels.append(lab)
+        cc=QToolButton(); cc.setText('☷'); cc.setToolTip('Control Centre'); cc.clicked.connect(self.show_control_centre)
+        cc.setStyleSheet('QToolButton{color:white;background:rgba(255,255,255,35);border:0;border-radius:5px;padding:3px 7px;font-size:13px;} QToolButton:hover{background:rgba(255,255,255,65);}')
+        row.addWidget(cc)
+        self.control_centre=ControlCentre(self)
+        self.clock=QLabel(); self.clock.setStyleSheet('color:white;font-size:12px;font-weight:600;padding-left:3px;'); row.addWidget(self.clock)
+        self.timer=QTimer(self); self.timer.timeout.connect(self.update_clock); self.timer.start(1000); self.update_clock()
+        self.setStyleSheet("""
+            QToolButton{color:white;background:transparent;border:0;padding:4px 1px;font-size:12px;font-weight:600}
+            QToolButton:hover{color:#dceaff}
+            QMenu{background:rgba(34,36,44,248);color:white;border:1px solid rgba(255,255,255,48);padding:6px;border-radius:9px}
+            QMenu::item{padding:8px 27px;border-radius:5px} QMenu::item:selected{background:rgba(255,255,255,40)}
+        """)
+
+    def show_control_centre(self):
+        if self.control_centre.isVisible(): self.control_centre.hide(); return
+        point=self.mapToGlobal(QPoint(self.width()-self.control_centre.width()-10,self.height()+5))
+        screen=QApplication.primaryScreen().availableGeometry()
+        x=min(max(screen.left()+5,point.x()),screen.right()-self.control_centre.width()-5)
+        self.control_centre.move(x,point.y()); self.control_centre.show(); self.control_centre.raise_()
+
+    def add_menu(self,layout,title,actions):
+        button=QToolButton(); button.setText(title); button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu=QMenu(button)
+        for label,callback in actions: menu.addAction(label,callback)
+        button.setMenu(menu); layout.addWidget(button)
+
+    def update_clock(self): self.clock.setText(datetime.now().strftime('%a %b %d  %I:%M %p'))
+    def about(self): QMessageBox.information(self,APP_NAME,f'TORNOS 2.0 — Version {VERSION}\nA lightweight macOS-inspired desktop companion for Windows.')
+    def paintEvent(self,event):
+        p=QPainter(self); p.fillRect(self.rect(),QColor(10,15,27,238)); p.setPen(QPen(QColor(255,255,255,24),1)); p.drawLine(0,self.height()-1,self.width(),self.height()-1)
+
+
+class Dock(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.items = load_dock()
+        self.provider = QFileIconProvider()
+        self.finder = None
+        self.shown = True
+        self.last_cursor = None
+        self.press_index = None
+        self.press_pos = None
+        self.dragging = False
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+        self.resize(self.width_for_items(), 100)
+        self.screen = QApplication.primaryScreen()
+        self.animation = QPropertyAnimation(self, b"geometry", self)
+        self.animation.setDuration(270)
+        self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.hide_dock)
+        self.pointer_timer = QTimer(self)
+        self.pointer_timer.timeout.connect(self.track_pointer)
+        self.pointer_timer.start(55)
+        self.position_dock()
+        self.tray = self.make_tray()
+        self.taskbar_guard = QTimer(self)
+        self.taskbar_guard.timeout.connect(self.enforce_taskbar_hidden)
+        self.taskbar_guard.start(1400)
+
+    def enforce_taskbar_hidden(self):
+        if WINDOWS and TASKBAR_LOCKED:
+            hwnd=USER32.FindWindowW("Shell_TrayWnd", None)
+            if hwnd and USER32.IsWindowVisible(hwnd):
+                taskbar(False)
+
+    def width_for_items(self):
+        return max(440, min(900, len(self.items)*76+50))
+
+    def bottom_edge(self):
+        rect = self.screen.geometry() if TASKBAR_HIDDEN or not WINDOWS else self.screen.availableGeometry()
+        return rect.y()+rect.height()
+
+    def position_dock(self):
+        rect = self.screen.geometry()
+        self.resize(self.width_for_items(), 100)
+        self.x_pos = rect.x()+(rect.width()-self.width())//2
+        bottom = self.bottom_edge()
+        self.visible_y = bottom-self.height()-5
+        self.hidden_y = bottom-8
+        self.move(self.x_pos, self.visible_y if self.shown else self.hidden_y)
+
+    def centres(self):
+        n = len(self.items)
+        left, right = 42, self.width()-42
+        if n <= 1:
+            return [self.width()/2]
+        gap = (right-left)/(n-1)
+        return [left+i*gap for i in range(n)]
+
+    def reveal(self):
+        self.hide_timer.stop()
+        if not self.shown:
+            self.shown = True
+            self.animate_to(self.visible_y)
+        self.update()
+
+    def animate_to(self, y):
+        self.animation.stop()
+        start = self.geometry()
+        end = QRectF(start).toRect()
+        end.moveTop(y)
+        self.animation.setStartValue(start)
+        self.animation.setEndValue(end)
+        self.animation.start()
+
+    def hide_dock(self):
+        if self.shown and not self.geometry().contains(QCursor.pos()):
+            self.shown = False
+            self.animate_to(self.hidden_y)
+
+    def track_pointer(self):
+        pos = QCursor.pos()
+        if pos != self.last_cursor:
+            self.last_cursor = pos
+            self.update()
+        if pos.y() >= self.bottom_edge()-2:
+            self.reveal()
+            self.hide_timer.stop()
+        elif self.shown and not self.geometry().contains(pos) and not self.hide_timer.isActive():
+            self.hide_timer.start(800)
+
+    def finder_icon_rect(self):
+        index = next((i for i, item in enumerate(self.items) if item.get("path") == "__finder__"), 0)
+        centres = self.centres()
+        centre_x = self.x_pos + int(centres[index])
+        centre_y = self.visible_y + 51
+        return QRect(centre_x-24, centre_y-24, 48, 48)
+
+    def open_finder(self):
+        if self.finder is None:
+            self.finder = FinderWindow(self)
+        if self.finder.minimized:
+            self.finder.animate_restore()
+        else:
+            self.finder.show()
+            self.finder.raise_()
+            self.finder.activateWindow()
+
+    def add_item(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose an app, shortcut or file", str(Path.home()), "All files (*.*)")
+        if path:
+            self.pin(path)
+
+    def pin(self, path):
+        path = str(Path(path))
+        if any(x.get("path", "").casefold() == path.casefold() for x in self.items):
+            return
+        self.items.append({"name": Path(path).stem[:28] or Path(path).name, "path": path, "kind": "custom"})
+        save_dock(self.items)
+        self.position_dock()
+        self.update()
+
+    def hide_taskbar(self):
+        if not WINDOWS:
+            QMessageBox.information(self, APP_NAME, "This feature is available on Windows.")
+            return
+        answer = QMessageBox.question(
+            self, "Hide Windows taskbar?",
+            "TORNOS will hide the Windows taskbar. Use TORNOS → View → Show Windows Taskbar to restore it. It is also restored when TORNOS exits normally.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            global TASKBAR_LOCKED
+            TASKBAR_LOCKED = True
+            TASKBAR_PREFERENCE.write_text("enabled\n", encoding="utf-8")
+            if taskbar(False):
+                self.position_dock()
+                self.reveal()
+            else:
+                QMessageBox.warning(self, APP_NAME, "Windows could not hide the taskbar.")
+
+    def show_taskbar(self):
+        global TASKBAR_LOCKED
+        TASKBAR_LOCKED = False
+        TASKBAR_PREFERENCE.unlink(missing_ok=True)
+        if WINDOWS:
+            taskbar(True)
+            self.position_dock()
+
+    def help(self):
+        QMessageBox.information(
+            self, "TORNOS Help",
+            "DOCK\n• Move to the bottom edge to reveal it; move away to auto-hide.\n"
+            "• Hover for magnification; click an icon to open it.\n"
+            "• Drag a shortcut, file or folder from Explorer onto the dock to pin it.\n"
+            "• Drag a dock icon left/right to reorder it. Right-click to remove it.\n\n"
+            "FINDER\n• Browse with the sidebar and address bar.\n• Double-click folders to enter and files to open.\n"
+            "• Right-click items to open, rename, copy their path or create folders.\n"
+            "• Search covers common user folders by name (not file contents).\n\n"
+            "TASKBAR\n• Use TORNOS → View to hide or restore the Windows taskbar. Once enabled, TORNOS keeps it hidden while running; it restores on exit.\n\nCONTROL CENTRE\n• Volume slider uses the optional pycaw audio bridge. Brightness works on supported built-in displays. Wi-Fi/Bluetooth opens Windows quick controls (Win+A) so you can use the actual system toggles.\n\nWINDOW\n• Yellow button animates Finder into the dock. Click Finder to restore it.\n• Green button animates maximize/restore. Double-click the title strip to toggle."
+        )
+
+    def make_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return None
+        pix = QPixmap(32, 32)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor("#263d5c"))
+        p.setPen(QPen(QColor("#d9eaff"), 1))
+        p.drawRoundedRect(QRectF(1, 1, 30, 30), 8, 8)
+        p.setPen(QColor("white"))
+        p.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
+        p.drawText(QRectF(1, 0, 30, 31), Qt.AlignmentFlag.AlignCenter, "T")
+        p.end()
+        tray = QSystemTrayIcon(QIcon(pix), self)
+        menu = QMenu()
+        menu.addAction("Open Finder", self.open_finder)
+        menu.addAction("Show Dock", self.reveal)
+        menu.addAction("Show Windows Taskbar", self.show_taskbar)
+        menu.addSeparator()
+        menu.addAction("Quit TORNOS", QApplication.quit)
+        tray.setContextMenu(menu)
+        tray.activated.connect(lambda reason: self.open_finder() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
+        tray.show()
+        return tray
+
+    def index_at(self, x):
+        for i, centre in enumerate(self.centres()):
+            if abs(x-centre) < 34:
+                return i
+        return None
+
+    def contextMenuEvent(self, event):
+        i = self.index_at(event.pos().x())
+        menu = QMenu(self)
+        if i is None:
+            menu.addAction("Add to Dock…", self.add_item)
+            menu.addAction("Dock Help", self.help)
+        else:
+            item = self.items[i]
+            menu.addAction("Open "+item["name"], lambda p=item["path"]: self.activate(p))
+            if i > 0:
+                menu.addAction("Move Left", lambda n=i: self.move_item(n, n-1))
+            if i < len(self.items)-1:
+                menu.addAction("Move Right", lambda n=i: self.move_item(n, n+1))
+            menu.addSeparator()
+            menu.addAction("Remove from Dock", lambda n=i: self.remove_item(n))
+        menu.exec(event.globalPos())
+
+    def activate(self, path):
+        if path == "__finder__":
+            self.open_finder()
+        else:
+            open_path(path)
+
+    def move_item(self, source, target):
+        if 0 <= source < len(self.items) and 0 <= target < len(self.items) and source != target:
+            self.items.insert(target, self.items.pop(source))
+            save_dock(self.items)
+            self.update()
+
+    def remove_item(self, index):
+        if 0 <= index < len(self.items):
+            self.items.pop(index)
+            save_dock(self.items)
+            self.position_dock()
+            self.update()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            if url.isLocalFile() and os.path.exists(url.toLocalFile()):
+                self.pin(url.toLocalFile())
+        event.acceptProposedAction()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.press_pos = event.position().toPoint()
+            self.press_index = self.index_at(event.position().x())
+            self.dragging = False
+
+    def mouseMoveEvent(self, event):
+        if self.press_pos is not None and self.press_index is not None:
+            if (event.position().toPoint()-self.press_pos).manhattanLength() >= 13:
+                self.dragging = True
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.press_index is not None:
+            if self.dragging:
+                target = self.index_at(event.position().x())
+                if target is not None:
+                    self.move_item(self.press_index, target)
+            else:
+                self.activate(self.items[self.press_index]["path"])
+        self.press_pos = self.press_index = None
+        self.dragging = False
+
+    def draw_icon(self, p, item, rect):
+        kind = item.get("kind", "custom")
+        if kind == "custom":
+            icon = self.provider.icon(QFileInfo(item["path"]))
+            if not icon.isNull():
+                icon.paint(p, rect.toRect())
+                return
+            kind = "settings"
+        colors = {
+            "finder": ("#43b5f5", "#1762b2"),
+            "chrome": ("#f4d24c", "#d94a3d"),
+            "notes": ("#ffffff", "#d8e4f0"),
+            "calculator": ("#65758b", "#202a39"),
+            "settings": ("#bdc9d8", "#66758a"),
+            "trash": ("#edf7fb", "#91b4c7"),
+        }
+        a, b = colors.get(kind, ("#7895b7", "#30445e"))
+        grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        grad.setColorAt(0, QColor(a))
+        grad.setColorAt(1, QColor(b))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawRoundedRect(rect, 11, 11)
+        if kind == "finder":
+            p.setPen(QPen(QColor(255,255,255,220), 1.2))
+            p.drawLine(int(rect.center().x()), int(rect.top()+5), int(rect.center().x()), int(rect.bottom()-5))
+            p.setBrush(QColor("white"))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QRectF(rect.left()+11, rect.top()+16, 4, 4))
+            p.drawEllipse(QRectF(rect.center().x()+7, rect.top()+16, 4, 4))
+            p.setPen(QPen(QColor("white"), 1.7))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawArc(QRectF(rect.left()+12, rect.top()+22, rect.width()-24, 13), 205*16, 130*16)
+        elif kind == "chrome":
+            p.setPen(QPen(QColor(255,255,255,210), 1))
+            for color, start in (("#31a85a", 30), ("#f0c33c", 150), ("#df4d43", 270)):
+                p.setBrush(QColor(color))
+                p.drawPie(rect.adjusted(4,4,-4,-4), start*16, 120*16)
+            p.setBrush(QColor("#4b9fe8"))
+            p.drawEllipse(QRectF(rect.center().x()-8, rect.center().y()-8, 16, 16))
+        elif kind == "notes":
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#f2c84e"))
+            p.drawRoundedRect(QRectF(rect.left()+5, rect.top()+5, rect.width()-10, 11), 3, 3)
+            p.setPen(QPen(QColor("#9ba8b8"), 1.3))
+            for y in (rect.top()+23, rect.top()+30, rect.top()+37):
+                p.drawLine(int(rect.left()+10), int(y), int(rect.right()-10), int(y))
+        elif kind == "calculator":
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#e1e8f0"))
+            p.drawRoundedRect(QRectF(rect.left()+8, rect.top()+7, rect.width()-16, 11), 3, 3)
+            for row in range(2):
+                for col in range(3):
+                    p.setBrush(QColor("#d5deea"))
+                    p.drawRoundedRect(QRectF(rect.left()+9+col*10, rect.top()+24+row*10, 6, 6), 2, 2)
+        elif kind == "settings":
+            p.setPen(QColor("#273447"))
+            p.setFont(QFont("Segoe UI Symbol", max(16, int(rect.width()*.48)), QFont.Weight.Bold))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "⚙")
+        elif kind == "trash":
+            p.setPen(QPen(QColor("#587184"), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QRectF(rect.left()+13, rect.top()+15, rect.width()-26, rect.height()-22), 3, 3)
+            p.drawLine(int(rect.left()+11), int(rect.top()+13), int(rect.right()-11), int(rect.top()+13))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        panel = QRectF(5, 14, self.width()-10, 78)
+        p.setPen(QPen(QColor(255,255,255,100), 1))
+        p.setBrush(QColor(30,33,43,225))
+        p.drawRoundedRect(panel, 24, 24)
+        shine = QLinearGradient(0, 14, 0, 55)
+        shine.setColorAt(0, QColor(255,255,255,38))
+        shine.setColorAt(1, QColor(255,255,255,0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(shine))
+        p.drawRoundedRect(QRectF(7,15,self.width()-14,38), 21, 21)
+        mouse = self.mapFromGlobal(QCursor.pos())
+        hover = self.rect().contains(mouse)
+        for i, item in enumerate(self.items):
+            x = self.centres()[i]
+            distance = abs(mouse.x()-x) if hover else 9999
+            scale = 1.0 + .48*max(0.0, 1.0-distance/110.0)
+            size = 48*scale
+            icon_rect = QRectF(x-size/2, 51-size/2, size, size)
+            self.draw_icon(p, item, icon_rect)
+            if hover and distance < 34:
+                p.setPen(QColor(255,255,255,245))
+                p.setFont(QFont("Segoe UI", 8))
+                p.drawText(QRectF(x-60, 0, 120, 14), Qt.AlignmentFlag.AlignCenter, item["name"])
+
+
+def main():
+    # If a previous run crashed while the taskbar was hidden, restore it first.
+    if WINDOWS and TASKBAR_STATE.exists() and not TASKBAR_PREFERENCE.exists():
+        taskbar(True)
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setQuitOnLastWindowClosed(False)
+
+    dock = Dock()
+    screen_obj = QApplication.primaryScreen()
+    screen = screen_obj.geometry() if screen_obj else QRect(0, 0, 1280, 800)
+    bar = MenuBar(dock)
+    bar.setGeometry(screen.x(), screen.y(), screen.width(), 31)
+    bar.show()
+    dock.show()
+    global TASKBAR_LOCKED
+    if WINDOWS and TASKBAR_PREFERENCE.exists():
+        TASKBAR_LOCKED = True
+        taskbar(False)
+    app.aboutToQuit.connect(restore_taskbar)
+    try:
+        return app.exec()
+    finally:
+        restore_taskbar()
+
+
+if __name__ == "__main__":
+    main()
